@@ -1,0 +1,552 @@
+// Copyright 2016 Emilie Gillet.
+//
+// Author: Emilie Gillet (emilie.o.gillet@gmail.com)
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+// 
+// The above copyright notice and this permission notice shall be included in
+// all copies or substantial portions of the Software.
+// 
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+// THE SOFTWARE.
+// 
+// See http://creativecommons.org/licenses/MIT/ for more information.
+//
+// -----------------------------------------------------------------------------
+//
+// Main synthesis voice.
+
+#include "voice.h"
+#include "user_data.h"
+
+#include <algorithm>
+
+namespace plaits {
+
+using namespace std;
+using namespace stmlib;
+
+void Voice::Init(BufferAllocator* allocator) {
+  engines_.Init();
+
+  engines_.RegisterInstance(&virtual_analog_vcf_engine_, false, 1.0f, 1.0f);
+  engines_.RegisterInstance(&phase_distortion_engine_, false, 0.7f, 0.7f);
+  engines_.RegisterInstance(&six_op_engine_, true, 1.0f, 1.0f);
+  engines_.RegisterInstance(&six_op_engine_, true, 1.0f, 1.0f);
+  engines_.RegisterInstance(&six_op_engine_, true, 1.0f, 1.0f);
+  engines_.RegisterInstance(&wave_terrain_engine_, false, 0.7f, 0.7f);
+  engines_.RegisterInstance(&string_machine_engine_, false, 0.8f, 0.8f);
+  engines_.RegisterInstance(&chiptune_engine_, false, 0.5f, 0.5f);
+  
+  engines_.RegisterInstance(&virtual_analog_engine_, false, 0.8f, 0.8f);
+  engines_.RegisterInstance(&waveshaping_engine_, false, 0.7f, 0.6f);
+  engines_.RegisterInstance(&fm_engine_, false, 0.6f, 0.6f);
+  engines_.RegisterInstance(&grain_engine_, false, 0.7f, 0.6f);
+  engines_.RegisterInstance(&additive_engine_, false, 0.8f, 0.8f);
+  engines_.RegisterInstance(&wavetable_engine_, false, 0.6f, 0.6f);
+  engines_.RegisterInstance(&chord_engine_, false, 0.8f, 0.8f);
+  engines_.RegisterInstance(&speech_engine_, false, -0.7f, 0.8f);
+
+  engines_.RegisterInstance(&swarm_engine_, false, -3.0f, 1.0f);
+  engines_.RegisterInstance(&noise_engine_, false, -1.0f, -1.0f);
+  engines_.RegisterInstance(&particle_engine_, false, -2.0f, 1.0f);
+  engines_.RegisterInstance(&string_engine_, true, -1.0f, 0.8f);
+  engines_.RegisterInstance(&modal_engine_, true, -1.0f, 0.8f);
+  engines_.RegisterInstance(&bass_drum_engine_, true, 0.8f, 0.8f);
+  engines_.RegisterInstance(&snare_drum_engine_, true, 0.8f, 0.8f);
+  engines_.RegisterInstance(&hi_hat_engine_, true, 0.8f, 0.8f);
+  
+  for (int i = 0; i < engines_.size(); ++i) {
+    // All engines will share the same RAM space.
+    allocator->Free();
+    engines_.get(i)->Init(allocator);
+  }
+  
+  engine_quantizer_.Init(engines_.size(), 0.05f, true);
+  previous_engine_index_ = -1;
+  reload_user_data_ = false;
+  engine_cv_ = 0.0f;
+  
+  out_post_processor_.Init();
+  aux_post_processor_.Init();
+  out_dry_post_processor_.Init();
+  aux_dry_post_processor_.Init();
+
+  decay_envelope_.Init();
+  lpg_envelope_.Init();
+  
+  trigger_state_ = false;
+  previous_note_ = 0.0f;
+  
+  // Warps Lite FM phase
+  fm_phase_ = 0.0f;
+  
+  trigger_delay_.Init(trigger_delay_line_);
+}
+
+void Voice::Render(
+    const Patch& patch,
+    const Modulations& modulations,
+    Frame* frames,
+    size_t size) {
+  // Trigger, LPG, internal envelope.
+      
+  // Delay trigger by 1ms to deal with sequencers or MIDI interfaces whose
+  // CV out lags behind the GATE out.
+  trigger_delay_.Write(modulations.trigger);
+  float trigger_value = trigger_delay_.Read(kTriggerDelay);
+  
+  bool previous_trigger_state = trigger_state_;
+  if (!previous_trigger_state) {
+    if (trigger_value > 0.3f) {
+      trigger_state_ = true;
+      if (!modulations.level_patched) {
+        lpg_envelope_.Trigger();
+      }
+      decay_envelope_.Trigger();
+      engine_cv_ = modulations.engine;
+    }
+  } else {
+    if (trigger_value < 0.1f) {
+      trigger_state_ = false;
+    }
+  }
+  if (!modulations.trigger_patched) {
+    engine_cv_ = modulations.engine;
+  }
+
+  // Engine selection.
+  int engine_index = engine_quantizer_.Process(
+      patch.engine,
+      engine_cv_);
+  
+  Engine* e = engines_.get(engine_index);
+  
+  // When reload_user_data_ is set, we need to reload user data for engines.
+  // IMPORTANT: Engines 2, 3, 4 share the SAME six_op_engine_ instance!
+  // We must only load the data for the CURRENT engine index, not all three,
+  // otherwise the last one (bank 3) always wins.
+  // Other engines (5=wave_terrain, 13=wavetable) have unique instances.
+  if (reload_user_data_) {
+    UserData user_data;
+    
+    // Load data for unique engine instances (wave terrain, wavetable)
+    // These can be loaded regardless of current engine since they're separate instances
+    static const int unique_user_data_engines[] = {5, 13};
+    for (int i = 0; i < 2; ++i) {
+      int idx = unique_user_data_engines[i];
+      const uint8_t* data = user_data.ptr(idx);
+      engines_.get(idx)->LoadUserData(data);
+    }
+    
+    // For the current engine (including shared FM engines), load its specific data
+    const uint8_t* data = user_data.ptr(engine_index);
+    if (!data && engine_index >= 2 && engine_index <= 4) {
+      data = fm_patches_table[engine_index - 2];
+    }
+    e->LoadUserData(data);
+    e->Reset();
+    
+    reload_user_data_ = false;
+  }
+  
+  if (engine_index != previous_engine_index_) {
+    UserData user_data;
+    const uint8_t* data = user_data.ptr(engine_index);
+    if (!data && engine_index >= 2 && engine_index <= 4) {
+      data = fm_patches_table[engine_index - 2];
+    }
+    e->LoadUserData(data);
+    e->Reset();
+
+    out_post_processor_.Reset();
+    previous_engine_index_ = engine_index;
+  }
+  EngineParameters p;
+
+  bool rising_edge = trigger_state_ && !previous_trigger_state;
+  float note = (modulations.note + previous_note_) * 0.5f;
+  previous_note_ = modulations.note;
+  const PostProcessingSettings& pp_s = e->post_processing_settings;
+
+  if (modulations.trigger_patched) {
+    p.trigger = (rising_edge ? TRIGGER_RISING_EDGE : TRIGGER_LOW) | \
+      (trigger_state_ ? TRIGGER_HIGH : TRIGGER_LOW);
+  } else {
+    p.trigger = TRIGGER_UNPATCHED;
+  }
+  
+  // Use reference block size (24) for consistent decay timing regardless of actual block size
+  const float short_decay = (200.0f * 24.0f) / kSampleRate *
+      SemitonesToRatio(-96.0f * patch.decay);
+
+  // Process envelope multiple times to compensate for larger block sizes
+  // Original code assumed 24-sample blocks, so we need to process kMaxBlockSize/24 times
+  const int envelope_updates = kMaxBlockSize / 24;
+  for (int i = 0; i < envelope_updates; ++i) {
+    decay_envelope_.Process(short_decay * 2.0f);
+  }
+
+  float compressed_level = 1.3f * modulations.level / (0.3f + fabsf(modulations.level));
+  CONSTRAIN(compressed_level, 0.0f, 1.0f);
+  p.accent = modulations.level_patched ? compressed_level : 0.8f;
+
+  bool use_internal_envelope = modulations.trigger_patched;
+
+  // Actual synthesis parameters.
+  
+  p.harmonics = patch.harmonics + modulations.harmonics;
+  CONSTRAIN(p.harmonics, 0.0f, 1.0f);
+
+  float internal_envelope_amplitude = 1.0f;
+  float internal_envelope_amplitude_timbre = 1.0f;
+  if (engine_index == 15) {
+    internal_envelope_amplitude = 2.0f - p.harmonics * 6.0f;
+    CONSTRAIN(internal_envelope_amplitude, 0.0f, 1.0f);
+    speech_engine_.set_prosody_amount(
+        !modulations.trigger_patched || modulations.frequency_patched ?
+            0.0f : patch.frequency_modulation_amount);
+    speech_engine_.set_speed( 
+        !modulations.trigger_patched || modulations.morph_patched ?
+            0.0f : patch.morph_modulation_amount);
+  } else if (engine_index == 7) {
+    if (modulations.trigger_patched && !modulations.timbre_patched) {
+      // Disable internal envelope on TIMBRE, and enable the envelope generator
+      // built into the chiptune engine.
+      internal_envelope_amplitude_timbre = 0.0f;
+      chiptune_engine_.set_envelope_shape(patch.timbre_modulation_amount);
+    } else {
+      chiptune_engine_.set_envelope_shape(ChiptuneEngine::NO_ENVELOPE);
+    }
+  }
+  
+  p.note = ApplyModulations(
+      patch.note + note,
+      patch.frequency_modulation_amount,
+      modulations.frequency_patched,
+      modulations.frequency,
+      use_internal_envelope,
+      internal_envelope_amplitude * \
+          decay_envelope_.value() * decay_envelope_.value() * 48.0f,
+      1.0f,
+      -119.0f,
+      120.0f);
+
+  p.timbre = ApplyModulations(
+      patch.timbre,
+      patch.timbre_modulation_amount,
+      modulations.timbre_patched,
+      modulations.timbre,
+      use_internal_envelope,
+      internal_envelope_amplitude_timbre * decay_envelope_.value(),
+      0.0f,
+      0.0f,
+      1.0f);
+
+  p.morph = ApplyModulations(
+      patch.morph,
+      patch.morph_modulation_amount,
+      modulations.morph_patched,
+      modulations.morph,
+      use_internal_envelope,
+      internal_envelope_amplitude * decay_envelope_.value(),
+      0.0f,
+      0.0f,
+      1.0f);
+
+  bool already_enveloped = pp_s.already_enveloped;
+  e->Render(p, out_buffer_, aux_buffer_, size, &already_enveloped);
+  
+  // Copy dry buffers before audio modulation
+  std::copy(out_buffer_, out_buffer_ + size, out_buffer_dry_);
+  std::copy(aux_buffer_, aux_buffer_ + size, aux_buffer_dry_);
+  
+  // Apply Warps Lite dual-stage audio modulation to wet buffers
+  // Stage 1 (IN1): 7 algorithms (no Vocoder)
+  if (modulations.audio_mod_in1 && modulations.audio_mod_mode1 > 0) {
+    ApplyAudioModulation(
+        out_buffer_, aux_buffer_,
+        modulations.audio_mod_in1,
+        modulations.audio_mod_mode1,
+        modulations.audio_mod_gain1,
+        modulations.audio_mod_level1,
+        modulations.audio_mod_timbre1,
+        size,
+        false);  // No Vocoder in Stage 1
+  }
+  
+  // Stage 2 (IN2): 8 algorithms (with Vocoder)
+  // Processes the output of Stage 1 (chained)
+  if (modulations.audio_mod_in2 && modulations.audio_mod_mode2 > 0) {
+    ApplyAudioModulation(
+        out_buffer_, aux_buffer_,
+        modulations.audio_mod_in2,
+        modulations.audio_mod_mode2,
+        modulations.audio_mod_gain2,
+        modulations.audio_mod_level2,
+        modulations.audio_mod_timbre2,
+        size,
+        true);  // Vocoder allowed in Stage 2
+  }
+  
+  bool lpg_bypass = already_enveloped || \
+      (!modulations.level_patched && !modulations.trigger_patched);
+  
+  // Compute LPG parameters.
+  if (!lpg_bypass) {
+    const float hf = patch.lpg_colour;
+    // Use reference block size (24) for consistent decay timing
+    const float decay_tail = (20.0f * 24.0f) / kSampleRate *
+        SemitonesToRatio(-72.0f * patch.decay + 12.0f * hf) - short_decay;
+    
+    if (modulations.level_patched) {
+      lpg_envelope_.ProcessLP(compressed_level, short_decay, decay_tail, hf);
+    } else {
+      // Use reference block size (24) for consistent attack timing
+      const float attack = NoteToFrequency(p.note) * 24.0f * 2.0f;
+      lpg_envelope_.ProcessPing(attack, short_decay, decay_tail, hf);
+    }
+  } else {
+    lpg_envelope_.Init();
+  }
+  
+  // Process wet outputs (with audio modulation) through LPG
+  out_post_processor_.Process(
+      pp_s.out_gain,
+      lpg_bypass,
+      lpg_envelope_.gain(),
+      lpg_envelope_.frequency(),
+      lpg_envelope_.hf_bleed(),
+      out_buffer_,
+      &frames->out,
+      size,
+      4);  // stride=4 for Frame with 4 shorts
+
+  aux_post_processor_.Process(
+      pp_s.aux_gain,
+      lpg_bypass,
+      lpg_envelope_.gain(),
+      lpg_envelope_.frequency(),
+      lpg_envelope_.hf_bleed(),
+      aux_buffer_,
+      &frames->aux,
+      size,
+      4);  // stride=4 for Frame with 4 shorts
+      
+  // Process dry outputs (no audio modulation) through LPG
+  out_dry_post_processor_.Process(
+      pp_s.out_gain,
+      lpg_bypass,
+      lpg_envelope_.gain(),
+      lpg_envelope_.frequency(),
+      lpg_envelope_.hf_bleed(),
+      out_buffer_dry_,
+      &frames->out_dry,
+      size,
+      4);  // stride=4 for Frame with 4 shorts
+
+  aux_dry_post_processor_.Process(
+      pp_s.aux_gain,
+      lpg_bypass,
+      lpg_envelope_.gain(),
+      lpg_envelope_.frequency(),
+      lpg_envelope_.hf_bleed(),
+      aux_buffer_dry_,
+      &frames->aux_dry,
+      size,
+      4);  // stride=4 for Frame with 4 shorts
+}
+
+// Warps Lite helper: Diode non-linearity for analog ring mod
+static inline float Diode(float x) {
+  float sign = x > 0.0f ? 1.0f : -1.0f;
+  float dead_zone = std::fabs(x) - 0.667f;
+  dead_zone += std::fabs(dead_zone);
+  dead_zone *= dead_zone;
+  return 0.04324765822726063f * dead_zone * sign;
+}
+
+// Warps Lite helper: Soft limiting
+static inline float SoftLimit(float x) {
+  return x / (1.0f + std::fabs(x));
+}
+
+// Warps Lite helper: Bipolar fold (approximation without LUT)
+static inline float BipolarFold(float x) {
+  // Simple folding: wrap into -1..1 range with folding
+  const float kRange = 4.0f;
+  x = std::fmod(x + kRange, kRange * 2.0f) - kRange;
+  if (x > 1.0f) x = 2.0f - x;
+  if (x < -1.0f) x = -2.0f - x;
+  return x;
+}
+
+void Voice::ApplyAudioModulation(
+    float* out, float* aux,
+    const float* mod_in,
+    int mode, float gain, float level, float timbre,
+    size_t size,
+    bool allow_vocoder) {
+  
+  // For Vocoder mode, we need to check if it's allowed (Stage 2 only)
+  if (mode == 8 && !allow_vocoder) {
+    return;  // Vocoder not allowed in Stage 1
+  }
+  
+  for (size_t i = 0; i < size; i++) {
+    // Apply gain (preamp) and level (modulator amount) to the modulator
+    float mod = mod_in[i] * gain * level;
+    float carrier = out[i];
+    float carrier_aux = aux[i];
+    float result = carrier;
+    float result_aux = carrier_aux;
+    
+    switch (mode) {
+      case 1:  // XFADE - Crossfade between synth and external
+        {
+          // Timbre controls crossfade curve (linear to equal-power-ish)
+          float fade = timbre;
+          result = carrier * (1.0f - fade) + mod * fade;
+          result_aux = carrier_aux * (1.0f - fade) + mod * fade;
+        }
+        break;
+        
+      case 2:  // FOLD - Wavefolding
+        {
+          float sum = carrier + mod + carrier * mod * 0.25f;
+          sum *= (0.02f + timbre);  // Timbre controls fold amount
+          result = BipolarFold(sum * 4.0f);
+          
+          float sum_aux = carrier_aux + mod + carrier_aux * mod * 0.25f;
+          sum_aux *= (0.02f + timbre);
+          result_aux = BipolarFold(sum_aux * 4.0f);
+        }
+        break;
+        
+      case 3:  // AnaRM - Analog Ring Modulation (diode-based)
+        {
+          float c = carrier * 2.0f;
+          float ring = Diode(mod + c) + Diode(mod - c);
+          ring *= (4.0f + timbre * 24.0f);
+          result = SoftLimit(ring);
+          
+          float c_aux = carrier_aux * 2.0f;
+          float ring_aux = Diode(mod + c_aux) + Diode(mod - c_aux);
+          ring_aux *= (4.0f + timbre * 24.0f);
+          result_aux = SoftLimit(ring_aux);
+        }
+        break;
+        
+      case 4:  // DigRM - Digital Ring Modulation
+        {
+          float ring = 4.0f * carrier * mod * (1.0f + timbre * 8.0f);
+          result = ring / (1.0f + std::fabs(ring));
+          
+          float ring_aux = 4.0f * carrier_aux * mod * (1.0f + timbre * 8.0f);
+          result_aux = ring_aux / (1.0f + std::fabs(ring_aux));
+        }
+        break;
+        
+      case 5:  // XOR - Bitwise XOR
+        {
+          int16_t c_short = static_cast<int16_t>(std::clamp(carrier * 32768.0f, -32768.0f, 32767.0f));
+          int16_t m_short = static_cast<int16_t>(std::clamp(mod * 32768.0f, -32768.0f, 32767.0f));
+          float xor_result = static_cast<float>(c_short ^ m_short) / 32768.0f;
+          float sum = (carrier + mod) * 0.7f;
+          result = sum + (xor_result - sum) * timbre;
+          
+          int16_t ca_short = static_cast<int16_t>(std::clamp(carrier_aux * 32768.0f, -32768.0f, 32767.0f));
+          float xor_aux = static_cast<float>(ca_short ^ m_short) / 32768.0f;
+          float sum_aux = (carrier_aux + mod) * 0.7f;
+          result_aux = sum_aux + (xor_aux - sum_aux) * timbre;
+        }
+        break;
+        
+      case 6:  // COMP - Comparator modes
+        {
+          // Timbre selects between: min, threshold, max, abs-max
+          float x = timbre * 2.995f;
+          int x_int = static_cast<int>(x);
+          float x_frac = x - x_int;
+          
+          float direct = mod < carrier ? mod : carrier;
+          float window = std::fabs(mod) > std::fabs(carrier) ? mod : carrier;
+          float threshold = carrier > 0.05f ? carrier : mod;
+          float window_2 = std::fabs(mod) > std::fabs(carrier) ? std::fabs(mod) : -std::fabs(carrier);
+          
+          float seq[4] = { direct, threshold, window, window_2 };
+          result = seq[x_int] + (seq[std::min(x_int + 1, 3)] - seq[x_int]) * x_frac;
+          
+          // Simplified for aux
+          float direct_aux = mod < carrier_aux ? mod : carrier_aux;
+          float window_aux = std::fabs(mod) > std::fabs(carrier_aux) ? mod : carrier_aux;
+          float threshold_aux = carrier_aux > 0.05f ? carrier_aux : mod;
+          float window_2_aux = std::fabs(mod) > std::fabs(carrier_aux) ? std::fabs(mod) : -std::fabs(carrier_aux);
+          
+          float seq_aux[4] = { direct_aux, threshold_aux, window_aux, window_2_aux };
+          result_aux = seq_aux[x_int] + (seq_aux[std::min(x_int + 1, 3)] - seq_aux[x_int]) * x_frac;
+        }
+        break;
+        
+      case 7:  // FM - Phase Modulation (true FM)
+        {
+          // Use modulator to modulate the phase of a simple oscillator
+          // that then ring-modulates with the carrier
+          // Timbre controls modulation depth
+          fm_phase_ += 0.01f + mod * timbre * 0.5f;
+          if (fm_phase_ >= 1.0f) fm_phase_ -= 1.0f;
+          if (fm_phase_ < 0.0f) fm_phase_ += 1.0f;
+          
+          // Simple sine approximation: 4x(x - x^2) for x in 0..1
+          float phase = fm_phase_;
+          float sine = phase < 0.5f 
+              ? 8.0f * phase * (0.5f - phase)
+              : -8.0f * (phase - 0.5f) * (1.0f - phase);
+          
+          // Ring modulate carrier with the FM sine
+          result = carrier * sine;
+          result_aux = carrier_aux * sine;
+        }
+        break;
+        
+      case 8:  // VOCODER - Simple vocoder effect (Stage 2 only)
+        {
+          // Simplified vocoder: use envelope follower on modulator
+          // to modulate carrier amplitude and add formant character
+          // This is a simplified version - real Warps vocoder is much more complex
+          float mod_env = std::fabs(mod);
+          
+          // Timbre controls formant emphasis (more high freq content)
+          float formant = 1.0f + timbre * 2.0f;
+          
+          // Simple formant-like filtering via nonlinearity
+          float shaped = mod * (1.0f + std::fabs(mod) * formant);
+          
+          // Apply modulator envelope to carrier
+          result = carrier * (0.2f + mod_env * 0.8f) + shaped * 0.3f;
+          result_aux = carrier_aux * (0.2f + mod_env * 0.8f) + shaped * 0.3f;
+          
+          // Soft limit
+          result = SoftLimit(result * 2.0f);
+          result_aux = SoftLimit(result_aux * 2.0f);
+        }
+        break;
+    }
+    
+    // Output the result directly (level already controls modulator contribution)
+    out[i] = result;
+    aux[i] = result_aux;
+  }
+}
+  
+}  // namespace plaits
