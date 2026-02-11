@@ -28,7 +28,7 @@
 
 #include <algorithm>
 
-#include "plaits/dsp/engine/grain_engine.h"
+#include "grain_engine.h"
 
 namespace plaits {
 

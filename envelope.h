@@ -1,4 +1,4 @@
-// Copyright 2021 Emilie Gillet.
+// Copyright 2016 Emilie Gillet.
 //
 // Author: Emilie Gillet (emilie.o.gillet@gmail.com)
 //
@@ -24,235 +24,107 @@
 //
 // -----------------------------------------------------------------------------
 //
-// Multi-segment envelope generator.
-//
-// The classic constant-time design (as found in many other MI products) might
-// cause differences in behavior from the original DX-series envelopes, in
-// particular when jumping to the last segment before having reached the sustain
-// phase.
-//
-// The unusual RenderAtSample() method allows the evaluation of the envelope at
-// an arbitrary point in time, used in Plaits' "envelope scrubbing" feature.
-//
-// A couple of quirks from the DX-series' operator envelopes are implemented,
-// namely:
-// - vaguely logarithmic shape for ascending segments.
-// - direct jump above a threshold for ascending segments.
-// - specific logic and rates for plateaus.
+// Envelope for the internal LPG.
 
-#ifndef PLAITS_DSP_FM_ENVELOPE_H_
-#define PLAITS_DSP_FM_ENVELOPE_H_
+#ifndef PLAITS_DSP_ENVELOPE_H_
+#define PLAITS_DSP_ENVELOPE_H_
 
 #include "stmlib.h"
 
-#include <algorithm>
-
-#include "dx_units.h"
-
 namespace plaits {
 
-namespace fm {
-
-template<int num_stages=4, bool reshape_ascending_segments=false>
-class Envelope {
+class LPGEnvelope {
  public:
-  Envelope() { }
-  ~Envelope() { }
-  
-  enum {
-    NUM_STAGES = num_stages,
-    PREVIOUS_LEVEL = -100
-  };
+  LPGEnvelope() { }
+  ~LPGEnvelope() { }
   
   inline void Init() {
-    Init(1.0f);
+    vactrol_state_ = 0.0f;
+    gain_ = 1.0f;
+    frequency_ = 0.5f;
+    hf_bleed_ = 0.0f;
+    ramp_up_ = false;
   }
   
-  inline void Init(float scale) {
-    scale_ = scale;
-    stage_ = num_stages - 1;
-    phase_ = 1.0f;
-    start_ = 0.0f;
-    for (int i = 0; i < num_stages; ++i) {
-      increment_[i] = 0.001f;
-      level_[i] = 1.0f / float(1 << i);
-    }
-    level_[num_stages - 1] = 0.0f;
-  }
-
-  // Directly copy the variables.
-  void Set(const float increment[num_stages], const float level[num_stages]) {
-    std::copy(&increment[0], &increment[num_stages], &increment_[0]);
-    std::copy(&level[0], &level[num_stages], &level_[0]);
+  inline void Trigger() {
+    ramp_up_ = true;
   }
   
-  inline float RenderAtSample(float t, const float gate_duration) {
-    if (t > gate_duration) {
-      // Check how far we are into the release phase.
-      const float phase = (t - gate_duration) * increment_[num_stages - 1];
-      return phase >= 1.0f
-          ? level_[num_stages - 1]
-          : value(num_stages - 1, phase,
-                RenderAtSample(gate_duration, gate_duration));
-    }
-
-    int stage = 0;
-    for (; stage < num_stages - 1; ++stage) {
-      const float stage_duration = 1.0f / increment_[stage];
-      if (t < stage_duration) {
-        break;
-      }
-      t -= stage_duration;
-    }
-
-    if (stage == num_stages - 1) {
-      t -= gate_duration;
-      if (t <= 0.0f) {
-        // TODO(pichenettes): this should always be true.
-        return level_[num_stages - 2];
-      } else if (t * increment_[num_stages - 1] > 1.0f) {
-        return level_[num_stages - 1];
+  inline void ProcessPing(
+      float attack,
+      float short_decay,
+      float decay_tail,
+      float hf) {
+    if (ramp_up_) {
+      vactrol_state_ += attack;
+      if (vactrol_state_ >= 1.0f) {
+        vactrol_state_ = 1.0f;
+        ramp_up_ = false;
       }
     }
-    return value(stage, t * increment_[stage], PREVIOUS_LEVEL);
+    ProcessLP(ramp_up_ ? vactrol_state_ : 0.0f, short_decay, decay_tail, hf);
   }
   
-  inline float Render(bool gate) {
-    return Render(gate, 1.0f, 1.0f, 1.0f);
-  }
-  
-  inline float Render(
-      bool gate,
-      float rate,
-      float ad_scale,
-      float release_scale) {
-    if (gate) {
-      if (stage_ == num_stages - 1) {
-        start_ = value();
-        stage_ = 0;
-        phase_ = 0.0f;
-      }
-    } else {
-      if (stage_ != num_stages - 1) {
-        start_ = value();
-        stage_ = num_stages - 1;
-        phase_ = 0.0f;
-      }
-    }
-    phase_ += increment_[stage_] * rate * \
-        (stage_ == num_stages - 1 ? release_scale : ad_scale);
-    if (phase_ >= 1.0f) {
-      if (stage_ >= num_stages - 2) {
-        phase_ = 1.0f;
-      } else {
-        phase_ = 0.0f;
-        ++stage_;
-      }
-      start_ = PREVIOUS_LEVEL;
-    }
+  inline void ProcessLP(
+      float level,
+      float short_decay,
+      float decay_tail,
+      float hf) {
+    float vactrol_input = level;
+    float vactrol_error = (vactrol_input - vactrol_state_);
+    float vactrol_state_2 = vactrol_state_ * vactrol_state_;
+    float vactrol_state_4 = vactrol_state_2 * vactrol_state_2;
+    float tail = 1.0f - vactrol_state_;
+    float tail_2 = tail * tail;
+    float vactrol_coefficient = (vactrol_error > 0.0f)
+        ? 0.6f
+        : short_decay + (1.0f - vactrol_state_4) * decay_tail;
+    vactrol_state_ += vactrol_coefficient * vactrol_error;
     
-    return value();
+    gain_ = vactrol_state_;
+    frequency_ = 0.003f + 0.3f * vactrol_state_4 + hf * 0.04f;
+    hf_bleed_ = (tail_2 + (1.0f - tail_2) * hf) * hf * hf;
   }
+  
+  inline float gain() const { return gain_; }
+  inline float frequency() const { return frequency_; }
+  inline float hf_bleed() const { return hf_bleed_; }
   
  private:
-  inline float value() {
-    return value(stage_, phase_, start_);
-  }
+  float vactrol_state_;
+  float gain_;
+  float frequency_;
+  float hf_bleed_;
+  bool ramp_up_;
   
-  inline float value(int stage, float phase, float start_level) {
-   float from = start_level == PREVIOUS_LEVEL
-       ? level_[(stage - 1 + num_stages) % num_stages] : start_level;
-   float to = level_[stage];
-   
-   if (reshape_ascending_segments && from < to) {
-     from = std::max(6.7f, from);
-     to = std::max(6.7f, to);
-     phase *= (2.5f - phase) * 0.666667f;
-   }
-   
-   return phase * (to - from) + from;
-  }
-
-  int stage_;
-  float phase_;
-  float start_;
-  
- protected:
-  float increment_[num_stages];
-  float level_[num_stages];
-  float scale_;
-  
-  DISALLOW_COPY_AND_ASSIGN(Envelope);
+  DISALLOW_COPY_AND_ASSIGN(LPGEnvelope);
 };
 
-class OperatorEnvelope : public Envelope<4, true> {
+class DecayEnvelope {
  public:
-  void Set(const uint8_t rate[NUM_STAGES], const uint8_t level[NUM_STAGES],
-           uint8_t global_level) {
-    // Configure levels.
-    for (int i = 0; i < NUM_STAGES; ++i) {
-      int level_scaled = OperatorLevel(level[i]);
-      level_scaled = (level_scaled & ~1) + global_level - 133; // 125 ?
-      level_[i] = 0.125f * \
-          (level_scaled < 1 ? 0.5f : static_cast<float>(level_scaled));
-    }
+  DecayEnvelope() { }
+  ~DecayEnvelope() { }
   
-    // Configure increments.
-    for (int i = 0; i < NUM_STAGES; ++i) {
-      float increment = OperatorEnvelopeIncrement(rate[i]);
-      float from = level_[(i - 1 + NUM_STAGES) % NUM_STAGES];
-      float to = level_[i];
-      
-      if (from == to) {
-        // Quirk: for plateaux, the increment is scaled.
-        increment *= 0.6f;
-        if (i == 0 && !level[i]) {
-          // Quirk: the attack plateau is faster.
-          increment *= 20.0f;
-        }
-      } else if (from < to) {
-        from = std::max(6.7f, from);
-        to = std::max(6.7f, to);
-        if (from == to) {
-          // Quirk: because of the jump, the attack might disappear.
-          increment = 1.0f;
-        } else {
-          // Quirk: because of the weird shape, the rate is adjusted.
-          increment *= 7.2f / (to - from);
-        }
-      } else {
-        increment *= 1.0f / (from - to);
-      }
-      increment_[i] = increment * scale_;
-    }
+  inline void Init() {
+    value_ = 0.0f;
   }
-};
-
-class PitchEnvelope : public Envelope<4, false> {
- public:
-  void Set(const uint8_t rate[NUM_STAGES], const uint8_t level[NUM_STAGES]) {
-    // Configure levels.
-    for (int i = 0; i < NUM_STAGES; ++i) {
-      level_[i] = PitchEnvelopeLevel(level[i]);
-    }
   
-    // Configure increments.
-    for (int i = 0; i < NUM_STAGES; ++i) {
-      float from = level_[(i - 1 + NUM_STAGES) % NUM_STAGES];
-      float to = level_[i];
-      float increment = PitchEnvelopeIncrement(rate[i]);
-      if (from != to) {
-        increment *= 1.0f / fabsf(from - to);
-      } else if (i != NUM_STAGES - 1) {
-        increment = 0.2f;
-      }
-      increment_[i] = increment * scale_;
-    }
+  inline void Trigger() {
+    value_ = 1.0f;
   }
+  
+  inline void Process(float decay) {
+    value_ *= (1.0f - decay);
+  }
+  
+  inline float value() const { return value_; }
+  
+ private:
+  float value_;
+  
+  DISALLOW_COPY_AND_ASSIGN(DecayEnvelope);
 };
-
-}  // namespace fm
 
 }  // namespace plaits
 
-#endif  // PLAITS_DSP_FM_ENVELOPE_H_
+#endif  // PLAITS_DSP_ENVELOPE_H_

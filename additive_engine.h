@@ -29,7 +29,7 @@
 #ifndef PLAITS_DSP_ENGINE_ADDITIVE_ENGINE_H_
 #define PLAITS_DSP_ENGINE_ADDITIVE_ENGINE_H_
 
-#include "engine/engine.h"
+#include "engine.h"
 #include "harmonic_oscillator.h"
 
 namespace plaits {

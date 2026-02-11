@@ -33,7 +33,7 @@
 
 #include "engine.h"
 #include "grainlet_oscillator.h"
-#include "pvosim_oscillator.h"
+#include "vosim_oscillator.h"
 #include "z_oscillator.h"
 
 namespace plaits {
