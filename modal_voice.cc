@@ -34,7 +34,7 @@
 
 #include <algorithm>
 
-#include "nits.h"
+#include "units.h"
 #include "random.h"
 
 #include "dust.h"

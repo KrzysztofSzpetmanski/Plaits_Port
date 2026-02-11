@@ -36,7 +36,7 @@
 #include "parameter_interpolator.h"
 #include "polyblep.h"
 
-#include "plaits/resources.h"
+#include "resources.h"
 
 namespace plaits {
 

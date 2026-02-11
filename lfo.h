@@ -30,7 +30,7 @@
 #define PLAITS_DSP_FM_LFO_H_
 
 #include "stmlib.h"
-#include "andom.h"
+#include "random.h"
 
 #include "dx_units.h"
 #include "patch.h"

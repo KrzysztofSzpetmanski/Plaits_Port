@@ -32,7 +32,7 @@
 #include "dsp_stm.h"
 #include "parameter_interpolator.h"
 
-#include "oscillator/oscillator.h"
+#include "oscillator.h"
 #include "sine_oscillator.h"
 #include "resources.h"
 

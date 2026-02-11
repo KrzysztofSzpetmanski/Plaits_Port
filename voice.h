@@ -31,8 +31,10 @@
 
 #include "stmlib.h"
 
-#include "filter.h"
 #include "limiter.h"
+#include "envelope.h"
+
+#include "filter.h"
 #include "buffer_allocator.h"
 
 #include "additive_engine.h"
@@ -60,9 +62,11 @@
 #include "virtual_analog_vcf_engine.h"
 #include "wave_terrain_engine.h"
 
-#include "envelope.h"
+#include "envelope_fm.h"
 
 #include "low_pass_gate.h"
+
+#include "user_data.h"
 
 namespace plaits {
 
@@ -95,7 +99,8 @@ class ChannelPostProcessor {
       size_t size,
       size_t stride) {
     if (gain < 0.0f) {
-      limiter_.Process(-gain, in, size);
+      // limiter_.Process(-gain, in, size);
+      limiter_.Process(in, -gain, size);
     }
     const float post_gain = (gain < 0.0f ? 1.0f : gain) * -32767.0f;
     if (!bypass_lpg) {
@@ -116,7 +121,7 @@ class ChannelPostProcessor {
   }
   
  private:
-  stmlib::Limiter limiter_;
+  warps::Limiter limiter_;
   LowPassGate lpg_;
   
   DISALLOW_COPY_AND_ASSIGN(ChannelPostProcessor);

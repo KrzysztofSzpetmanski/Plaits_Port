@@ -32,8 +32,8 @@
 #include "stmlib.h"
 
 #include "algorithms.h"
-#include "pdx_units.h"
-#include "envelope.h"
+#include "dx_units.h"
+#include "envelope_fm.h"
 #include "patch.h"
 
 // When enabled, the amplitude modulation LFO linearly modulates the amplitude

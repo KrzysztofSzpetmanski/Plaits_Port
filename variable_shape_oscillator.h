@@ -38,7 +38,7 @@
 #include "parameter_interpolator.h"
 #include "polyblep.h"
 
-#include "plaits/dsp/oscillator/oscillator.h"
+#include "oscillator.h"
 
 #include <algorithm>
 

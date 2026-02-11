@@ -24,46 +24,77 @@
 //
 // -----------------------------------------------------------------------------
 //
-// Extended Karplus-Strong, with all the niceties from Rings.
+// Comb filter / KS string. "Lite" version of the implementation used in Rings.
 
-#ifndef PLAITS_DSP_PHYSICAL_STRING_VOICE_H_
-#define PLAITS_DSP_PHYSICAL_STRING_VOICE_H_
+#ifndef PLAITS_DSP_PHYSICAL_MODELLING_STRING_H_
+#define PLAITS_DSP_PHYSICAL_MODELLING_STRING_H_
+
+#include <algorithm>
+
+#include "stmlib.h"
 
 #include "filter.h"
 #include "buffer_allocator.h"
 
-#include "plaits_string.h"
+#include "delay_line.h"
+
+#include <string.h>
+#include <cstring>
 
 namespace plaits {
 
-class StringVoice {
+const size_t kDelayLineSize = 1024;
+
+enum StringNonLinearity {
+  STRING_NON_LINEARITY_CURVED_BRIDGE,
+  STRING_NON_LINEARITY_DISPERSION
+};
+
+class String {
  public:
-  StringVoice() { }
-  ~StringVoice() { }
+  String() { }
+  ~String() { }
   
   void Init(stmlib::BufferAllocator* allocator);
   void Reset();
-  void Render(
-      bool sustain,
-      bool trigger,
-      float accent,
+  void Process(
       float f0,
-      float structure,
+      float non_linearity_amount,
       float brightness,
       float damping,
-      float* temp,
+      const float* in,
       float* out,
-      float* aux,
+      size_t size);
+
+ private:
+  template<StringNonLinearity non_linearity>
+  void ProcessInternal(
+      float f0,
+      float non_linearity_amount,
+      float brightness,
+      float damping,
+      const float* in,
+      float* out,
       size_t size);
   
- private:
-  stmlib::Svf excitation_filter_;
-  String string_;
-  size_t remaining_noise_samples_;
+  DelayLine<float, kDelayLineSize> string_;
+  DelayLine<float, kDelayLineSize / 4> stretch_;
   
-  DISALLOW_COPY_AND_ASSIGN(StringVoice);
+  stmlib::Svf iir_damping_filter_;
+  stmlib::DCBlocker dc_blocker_;
+  
+  float delay_;
+  float dispersion_noise_;
+  float curved_bridge_;
+  
+  // Very crappy linear interpolation upsampler used for low pitches that
+  // do not fit the delay line. Rarely used.
+  float src_phase_;
+  float out_sample_[2];
+
+  DISALLOW_COPY_AND_ASSIGN(String);
 };
 
 }  // namespace plaits
 
-#endif  // PLAITS_DSP_PHYSICAL_STRING_VOICE_H_
+#endif  // PLAITS_DSP_PHYSICAL_MODELLING_STRING_H_

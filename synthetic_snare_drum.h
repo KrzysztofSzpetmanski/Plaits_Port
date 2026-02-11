@@ -39,7 +39,7 @@
 #include "parameter_interpolator.h"
 #include "units.h"
 
-#include "plaits/dsp/dsp.h"
+#include "dsp.h"
 
 namespace plaits {
 

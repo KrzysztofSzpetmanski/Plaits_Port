@@ -1,4 +1,4 @@
-// Copyright 2021 Emilie Gillet.
+// Copyright 2015 Emilie Gillet.
 //
 // Author: Emilie Gillet (emilie.o.gillet@gmail.com)
 //
@@ -24,39 +24,47 @@
 //
 // -----------------------------------------------------------------------------
 //
-// Phase distortion and phase modulation with an asymmetric triangle as the
-// modulator.
+// Limiter.
 
-#ifndef PLAITS_DSP_ENGINE_PHASE_DISTORTION_ENGINE_H_
-#define PLAITS_DSP_ENGINE_PHASE_DISTORTION_ENGINE_H_
+#ifndef WARPS_DSP_LIMITER_H_
+#define WARPS_DSP_LIMITER_H_
 
-#include "engine.h"
-#include "variable_shape_oscillator.h"
+#include "stmlib.h"
 
-namespace plaits {
-  
-class PhaseDistortionEngine : public Engine {
+#include <algorithm>
+
+#include "dsp_stm.h"
+#include "filter.h"
+
+namespace warps {
+
+class Limiter {
  public:
-  PhaseDistortionEngine() { }
-  ~PhaseDistortionEngine() { }
-  
-  virtual void Init(stmlib::BufferAllocator* allocator);
-  virtual void Reset();
-  virtual void LoadUserData(const uint8_t* user_data) { }
-  virtual void Render(const EngineParameters& parameters,
-      float* out,
-      float* aux,
-      size_t size,
-      bool* already_enveloped);
-  
+  Limiter() { }
+  ~Limiter() { }
+
+  void Init() {
+    peak_ = 0.5f;
+  }
+
+  void Process(
+      float* in_out,
+      float pre_gain,
+      size_t size) {
+    while (size--) {
+      float s = *in_out * pre_gain;
+      SLOPE(peak_, fabs(s), 0.05f, 0.00002f);
+      float gain = (peak_ <= 1.0f ? 1.0f : 1.0f / peak_);
+      *in_out++ = stmlib::SoftLimit(s * gain * 0.8f);
+    }
+  }
+
  private:
-  VariableShapeOscillator shaper_;
-  VariableShapeOscillator modulator_;
-  float* temp_buffer_;
-  
-  DISALLOW_COPY_AND_ASSIGN(PhaseDistortionEngine);
+  float peak_;
+
+  DISALLOW_COPY_AND_ASSIGN(Limiter);
 };
 
-}  // namespace plaits
+}  // namespace warps
 
-#endif  // PLAITS_DSP_ENGINE_PHASE_DISTORTION_ENGINE_H_
+#endif  // WARPS_DSP_LIMITER_H_

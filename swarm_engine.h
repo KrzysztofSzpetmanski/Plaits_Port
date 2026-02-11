@@ -29,7 +29,7 @@
 #ifndef PLAITS_DSP_ENGINE_SWARM_ENGINE_H_
 #define PLAITS_DSP_ENGINE_SWARM_ENGINE_H_
 
-#include "spolyblep.h"
+#include "polyblep.h"
 #include "units.h"
 #include "random.h"
 
